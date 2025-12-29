@@ -31,6 +31,8 @@ rfbScreenInfoPtr theScreen;
 jclass theInputService;
 jclass theMainService;
 JavaVM *theVM;
+/* Back buffer that is rendered to, swapped with the screen's framebuffer when done */
+char *backBuffer;
 
 /*
  * Modeled after rfbDefaultLog:
@@ -77,6 +79,9 @@ static void onPointerEvent(int buttonMask,int x,int y,rfbClientPtr cl)
         return;
     }
 
+    /* needed to allow multiple dragging actions at once */
+    cl->screen->pointerClient = NULL;
+
     jmethodID mid = (*env)->GetStaticMethodID(env, theInputService, "onPointerEvent", "(IIIJ)V");
     (*env)->CallStaticVoidMethod(env, theInputService, mid, buttonMask, x, y, (jlong)cl);
 
@@ -111,9 +116,47 @@ static void onCutText(char *text, __unused int len, rfbClientPtr cl)
         return;
     }
 
+    //Charset charset = Charset.forName("ISO-8859-1")
+    jclass clsCharset =  (*env)->FindClass(env,"java/nio/charset/Charset");
+    jmethodID midCharsetForName = (*env)->GetStaticMethodID(env, clsCharset, "forName", "(Ljava/lang/String;)Ljava/nio/charset/Charset;");
+    jobject charset = (*env)->CallStaticObjectMethod(env, clsCharset, midCharsetForName, (*env)->NewStringUTF(env, "ISO-8859-1"));
+
+    //CharBuffer charBuffer = charset.decode(byteBuffer)
+    jobject byteBuffer = (*env)->NewDirectByteBuffer(env, (jbyte *)text, strlen(text));
+    jmethodID midCharsetDecode = (*env)->GetMethodID(env, clsCharset, "decode", "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;");
+    jobject charBuffer = (*env)->CallObjectMethod(env, charset, midCharsetDecode, byteBuffer);
+    (*env)->DeleteLocalRef(env, byteBuffer);
+
+    //String jText = charBuffer.toString();
+    jclass clsCharBuffer = (*env)->FindClass(env, "java/nio/CharBuffer");
+    jmethodID midCharBufferToString = (*env)->GetMethodID(env, clsCharBuffer, "toString", "()Ljava/lang/String;");
+    jstring jText = (*env)->CallObjectMethod(env, charBuffer, midCharBufferToString);
+    (*env)->DeleteLocalRef(env, charBuffer);
+
     jmethodID mid = (*env)->GetStaticMethodID(env, theInputService, "onCutText", "(Ljava/lang/String;J)V");
-    jstring jText = (*env)->NewStringUTF(env, text);
     (*env)->CallStaticVoidMethod(env, theInputService, mid, jText, (jlong)cl);
+
+    (*env)->DeleteLocalRef(env, jText);
+    if ((*env)->ExceptionCheck(env))
+        (*env)->ExceptionDescribe(env);
+
+    (*theVM)->DetachCurrentThread(theVM);
+}
+
+static void onCutTextUTF8(char *text, __unused int len, rfbClientPtr cl)
+{
+    JNIEnv *env = NULL;
+    if ((*theVM)->AttachCurrentThread(theVM, &env, NULL) != 0) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "onCutTextUTF8: could not attach thread, there will be no input");
+        return;
+    }
+
+    jstring jText = (*env)->NewStringUTF(env, text);
+
+    jmethodID mid = (*env)->GetStaticMethodID(env, theInputService, "onCutText", "(Ljava/lang/String;J)V");
+    (*env)->CallStaticVoidMethod(env, theInputService, mid, jText, (jlong)cl);
+
+    (*env)->DeleteLocalRef(env, jText);
 
     if ((*env)->ExceptionCheck(env))
         (*env)->ExceptionDescribe(env);
@@ -124,6 +167,10 @@ static void onCutText(char *text, __unused int len, rfbClientPtr cl)
 void onClientDisconnected(rfbClientPtr cl)
 {
     JNIEnv *env = NULL;
+    // check if already attached. happens on reverse connections
+    (*theVM)->GetEnv(theVM, (void **) &env, JNI_VERSION_1_6);
+    int wasAlreadyAttached = env != NULL;
+    // AttachCurrentThread() on an already attached thread is a no-op. https://developer.android.com/training/articles/perf-jni#threads
     if ((*theVM)->AttachCurrentThread(theVM, &env, NULL) != 0) {
         __android_log_print(ANDROID_LOG_ERROR, TAG, "onClientDisconnected: could not attach thread, not calling MainService.onClientDisconnected()");
         return;
@@ -135,7 +182,9 @@ void onClientDisconnected(rfbClientPtr cl)
     if ((*env)->ExceptionCheck(env))
         (*env)->ExceptionDescribe(env);
 
-    (*theVM)->DetachCurrentThread(theVM);
+    // only detach if not attached before
+    if (!wasAlreadyAttached)
+        (*theVM)->DetachCurrentThread(theVM);
 }
 
 #pragma clang diagnostic push
@@ -171,42 +220,6 @@ static enum rfbNewClientAction onClientConnected(rfbClientPtr cl)
 }
 #pragma clang diagnostic pop
 
-rfbClientPtr
-repeaterConnection(rfbScreenInfoPtr rfbScreen,
-                   char *repeaterHost,
-                   int repeaterPort,
-                   const char* repeaterIdentifier)
-{
-    rfbSocket sock;
-    rfbClientPtr cl;
-    char id[250];
-    __android_log_print(ANDROID_LOG_INFO, TAG, "Connecting to a repeater Host: %s:%d.", repeaterHost, repeaterPort);
-
-    if ((sock = rfbConnect(rfbScreen, repeaterHost, repeaterPort)) < 0)
-        return NULL;
-
-    memset(id, 0, sizeof(id));
-    if(snprintf(id, sizeof(id), "ID:%s", repeaterIdentifier) >= (int)sizeof(id)) {
-        /* truncated! */
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Error, given ID is too long.\n");
-        return NULL;
-    }
-    __android_log_print(ANDROID_LOG_INFO, TAG, "Sending a repeater ID: %s.\n", id);
-    if (send(sock, id, sizeof(id),0) != sizeof(id)) {
-        rfbLog("writing id failed\n");
-        return NULL;
-    }
-    cl = rfbNewClient(rfbScreen, sock);
-    if (!cl) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "New client failed\n");
-        return NULL;
-    }
-
-    cl->reverseConnection = 0;
-    if (!cl->onHold)
-        rfbStartOnHoldClient(cl);
-    return cl;
-}
 
 /*
  * The VM calls JNI_OnLoad when the native library is loaded (for example, through System.loadLibrary).
@@ -245,7 +258,10 @@ JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncS
     rfbShutdownServer(theScreen, TRUE);
     free(theScreen->frameBuffer);
     theScreen->frameBuffer = NULL;
+    free(backBuffer);
+    backBuffer = NULL;
     free((char*)theScreen->desktopName); // always malloc'ed by us
+    free(theScreen->httpDir); // always malloc'ed by us
     theScreen->desktopName = NULL;
     if(theScreen->authPasswdData) { // if this is set, it was malloc'ed by us and has one password in there
         char **passwordList = theScreen->authPasswdData;
@@ -261,7 +277,7 @@ JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncS
 }
 
 
-JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncStartServer(JNIEnv *env, jobject thiz, jint width, jint height, jint port, jstring desktopname, jstring password) {
+JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncStartServer(JNIEnv *env, jobject thiz, jint width, jint height, jint port, jstring desktopname, jstring password, jstring httpRootDir) {
 
     int argc = 0;
 
@@ -277,7 +293,8 @@ JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncS
     }
 
     theScreen->frameBuffer=(char*)calloc(width * height * 4, 1);
-    if(!theScreen->frameBuffer) {
+    backBuffer = (char*)calloc(width * height * 4, 1);
+    if(!theScreen->frameBuffer || !backBuffer) {
         __android_log_print(ANDROID_LOG_ERROR, TAG, "vncStartServer: failed allocating framebuffer");
         Java_net_christianbeier_droidvnc_1ng_MainService_vncStopServer(env, thiz);
         return JNI_FALSE;
@@ -285,11 +302,16 @@ JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncS
     theScreen->ptrAddEvent = onPointerEvent;
     theScreen->kbdAddEvent = onKeyEvent;
     theScreen->setXCutText = onCutText;
-    theScreen->setXCutTextUTF8 = onCutText;
+    theScreen->setXCutTextUTF8 = onCutTextUTF8;
     theScreen->newClientHook = onClientConnected;
 
     theScreen->port = port;
     theScreen->ipv6port = port;
+
+    // don't show X cursor
+    theScreen->cursor = NULL;
+    // needed to allow multiple dragging actions at once
+    theScreen->deferPtrUpdateTime = 0;
 
     if(desktopname) { // string arg to GetStringUTFChars() must not be NULL
         const char *cDesktopName = (*env)->GetStringUTFChars(env, desktopname, NULL);
@@ -324,6 +346,16 @@ JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncS
         (*env)->ReleaseStringUTFChars(env, password, cPassword);
     }
 
+    if(httpRootDir) { // string arg to GetStringUTFChars() must not be NULL
+        const char *cHttpRootDir = (*env)->GetStringUTFChars(env, httpRootDir, NULL);
+        if(!cHttpRootDir) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "vncStartServer: failed getting http root dir from JNI");
+            Java_net_christianbeier_droidvnc_1ng_MainService_vncStopServer(env, thiz);
+            return JNI_FALSE;
+        }
+        theScreen->httpDir = strdup(cHttpRootDir);
+        (*env)->ReleaseStringUTFChars(env, httpRootDir, cHttpRootDir);
+    }
 
     rfbInitServer(theScreen);
 
@@ -342,61 +374,59 @@ JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncS
     return JNI_TRUE;
 }
 
-//TODO this runs on the main thread, in the worst case blocking for rfbMaxClientWait
-JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncConnectReverse(JNIEnv *env, __unused jobject thiz, jstring host, jint port)
+// The MainService run this on a worker thread, in the worst case blocking for rfbMaxClientWait
+JNIEXPORT jlong JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncConnectReverse(JNIEnv *env, __unused jobject thiz, jstring host, jint port)
 {
     if(!theScreen || !theScreen->frameBuffer)
-        return JNI_FALSE;
+        return 0;
 
     if(host) { // string arg to GetStringUTFChars() must not be NULL
         char *cHost = (char*)(*env)->GetStringUTFChars(env, host, NULL);
         if(!cHost) {
             __android_log_print(ANDROID_LOG_ERROR, TAG, "vncConnectReverse: failed getting desktop name from JNI");
-            return JNI_FALSE;
+            return 0;
         }
         rfbClientPtr cl = rfbReverseConnection(theScreen, cHost, port);
         (*env)->ReleaseStringUTFChars(env, host, cHost);
-        return cl != NULL;
+        return (jlong) cl;
     }
-    return JNI_FALSE;
+    return 0;
 }
 
-//TODO this runs on the main thread, in the worst case blocking for rfbMaxClientWait
-JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncConnectRepeater(JNIEnv *env, __unused jobject thiz, jstring host, jint port, jstring repeaterIdentifier)
+// The MainService run this on a worker thread, in the worst case blocking for rfbMaxClientWait
+JNIEXPORT jlong JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncConnectRepeater(JNIEnv *env, __unused jobject thiz, jstring host, jint port, jstring repeaterIdentifier)
 {
     if(!theScreen || !theScreen->frameBuffer)
-        return JNI_FALSE;
+        return 0;
 
     if(host && repeaterIdentifier) { // string arg to GetStringUTFChars() must not be NULL
         char *cHost = (char*)(*env)->GetStringUTFChars(env, host, NULL);
         if(!cHost) {
             __android_log_print(ANDROID_LOG_ERROR, TAG, "vncConnectRepeater: failed getting desktop name from JNI");
-            return JNI_FALSE;
+            return 0;
         }
         char *cRepeaterIdentifier = (char*)(*env)->GetStringUTFChars(env, repeaterIdentifier, NULL);
         if(!cRepeaterIdentifier) {
             __android_log_print(ANDROID_LOG_ERROR, TAG, "vncConnectRepeater: failed getting repeater ID from JNI");
-            return JNI_FALSE;
+            return 0;
         }
-        rfbClientPtr cl = repeaterConnection(theScreen, cHost, port, cRepeaterIdentifier);
+        rfbClientPtr cl = rfbUltraVNCRepeaterMode2Connection(theScreen, cHost, port, cRepeaterIdentifier);
         (*env)->ReleaseStringUTFChars(env, host, cHost);
         (*env)->ReleaseStringUTFChars(env, repeaterIdentifier, cRepeaterIdentifier);
-        return cl != NULL;
+        return (jlong) cl;
     }
-    return JNI_FALSE;
+    return 0;
 }
 
 
 JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncNewFramebuffer(__unused JNIEnv *env, __unused jobject thiz, jint width, jint height)
 {
-    rfbClientIteratorPtr iterator;
-    rfbClientPtr cl;
-
     char *oldfb, *newfb;
 
-    if(!theScreen || !theScreen->frameBuffer)
+    if(!theScreen || !theScreen->frameBuffer || !backBuffer)
         return JNI_FALSE;
 
+    /* screen's framebuffer */
     oldfb = theScreen->frameBuffer;
     newfb = calloc(width * height * 4, 1);
     if(!newfb) {
@@ -407,6 +437,11 @@ JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncN
     rfbNewFramebuffer(theScreen, (char*)newfb, width, height, 8, 3, 4);
 
     free(oldfb);
+
+    /* back buffer */
+    free(backBuffer);
+    backBuffer = calloc(width * height * 4, 1);
+
     __android_log_print(ANDROID_LOG_INFO, TAG, "vncNewFramebuffer: allocated new framebuffer, %dx%d", width, height);
 
     return JNI_TRUE;
@@ -417,12 +452,37 @@ JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncU
     void *cBuf = (*env)->GetDirectBufferAddress(env, buf);
     jlong bufSize = (*env)->GetDirectBufferCapacity(env, buf);
 
-    if(!theScreen || !theScreen->frameBuffer || !cBuf || bufSize < 0)
+    if(!theScreen || !theScreen->frameBuffer || !backBuffer || !cBuf || bufSize < 0)
         return JNI_FALSE;
 
-    double t0 = getTime();
-    memcpy(theScreen->frameBuffer, cBuf, bufSize);
-    __android_log_print(ANDROID_LOG_DEBUG, TAG, "vncUpdateFramebuffer: copy took %.3f ms", (getTime()-t0)*1000);
+    /*
+      Copy new frame to back buffer.
+    */
+    // only comment in when needed
+    //double t0 = getTime();
+    memcpy(backBuffer, cBuf, bufSize);
+    // only comment in when needed
+    //__android_log_print(ANDROID_LOG_DEBUG, TAG, "vncUpdateFramebuffer: copy took %.3f ms", (getTime()-t0)*1000);
+
+    /* Lock out client reads. */
+    rfbClientIteratorPtr iterator;
+    rfbClientPtr cl;
+    iterator = rfbGetClientIterator(theScreen);
+    while ((cl = rfbClientIteratorNext(iterator))) {
+        LOCK(cl->sendMutex);
+    }
+    rfbReleaseClientIterator(iterator);
+
+    /* Swap frame buffers. */
+    char *tmp = theScreen->frameBuffer;
+    theScreen->frameBuffer = backBuffer;
+    backBuffer = tmp;
+
+    iterator = rfbGetClientIterator(theScreen);
+    while ((cl = rfbClientIteratorNext(iterator))) {
+        UNLOCK(cl->sendMutex);
+    }
+    rfbReleaseClientIterator(iterator);
 
     rfbMarkRectAsModified(theScreen, 0, 0, theScreen->width, theScreen->height);
 
@@ -443,4 +503,99 @@ JNIEXPORT jint JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncGetFr
         return -1;
 
     return theScreen->height;
+}
+
+JNIEXPORT jboolean JNICALL Java_net_christianbeier_droidvnc_1ng_MainService_vncIsActive(__unused JNIEnv *env, __unused jobject thiz) {
+    return theScreen && rfbIsActive(theScreen);
+}
+
+JNIEXPORT void JNICALL
+Java_net_christianbeier_droidvnc_1ng_MainService_vncSendCutText(JNIEnv *env, __unused jclass clazz,
+                                                                jstring text) {
+    if (!theScreen || !text)
+        return;
+
+    /*
+     * Convert Android's UTF-8 to Latin-1.
+     * Some viewers eat UTF-8 payload in the Latin-1 cuttext just well, but some don't, so adhere to
+     * the spec and send Latin-1 here.
+    */
+    // text.getBytes("ISO-8859-1")
+    jclass clsString = (*env)->FindClass(env, "java/lang/String");
+    jmethodID midGetBytes = (*env)->GetMethodID(env, clsString, "getBytes", "(Ljava/lang/String;)[B");
+    jstring jCharsetName = (*env)->NewStringUTF(env, "ISO-8859-1");
+    jbyteArray latin1Bytes = (jbyteArray) (*env)->CallObjectMethod(env, text, midGetBytes, jCharsetName);
+
+    // copy byte array contents to C char array on the stack, +1 for null-terminator
+    jsize latin1BytesLength = (*env)->GetArrayLength(env, latin1Bytes);
+    char cLatin1Text[latin1BytesLength + 1];
+    (*env)->GetByteArrayRegion(env, latin1Bytes, 0, latin1BytesLength, (jbyte*)cLatin1Text);
+    cLatin1Text[latin1BytesLength] = '\0'; // Null-terminate the C string
+
+    // we can clean up local references here already, cLatin1Text is on the stack
+    (*env)->DeleteLocalRef(env, jCharsetName);
+    (*env)->DeleteLocalRef(env, latin1Bytes);
+
+    /*
+     * Get UTF-8 string, too
+     */
+    const char *cUTF8Text = (*env)->GetStringUTFChars(env, text, NULL);
+
+    /*
+     * Send!
+     */
+    rfbSendServerCutTextUTF8(theScreen, (char*) cUTF8Text, (int) strlen(cUTF8Text), cLatin1Text, (int) strlen(cLatin1Text));
+
+    /*
+     * Clean up
+     */
+    if (cUTF8Text)
+         (*env)->ReleaseStringUTFChars(env, text, cUTF8Text);
+}
+
+JNIEXPORT jstring JNICALL
+Java_net_christianbeier_droidvnc_1ng_MainService_vncGetRemoteHost(JNIEnv *env, __unused jobject thiz, jlong client) {
+    return (*env)->NewStringUTF(env, ((rfbClientPtr)client)->host);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_net_christianbeier_droidvnc_1ng_MainService_vncDisconnect(__unused JNIEnv *env, __unused jobject thiz, jlong client) {
+    rfbBool found = FALSE;
+    rfbClientIteratorPtr iterator;
+    rfbClientPtr cl;
+    iterator = rfbGetClientIterator(theScreen);
+    while ((cl = rfbClientIteratorNext(iterator)) != NULL) {
+        if (cl == (rfbClientPtr) client) {
+            found = TRUE;
+            rfbCloseClient((rfbClientPtr) client);
+            break;
+        }
+    }
+    rfbReleaseClientIterator(iterator);
+    return found;
+}
+
+JNIEXPORT jint JNICALL
+Java_net_christianbeier_droidvnc_1ng_MainService_vncGetDestinationPort(__unused JNIEnv *env,
+                                                                       __unused jobject thiz,
+                                                                       jlong client) {
+    int port = -1;
+    rfbClientIteratorPtr iterator;
+    rfbClientPtr cl;
+    iterator = rfbGetClientIterator(theScreen);
+    while (theScreen && (cl = rfbClientIteratorNext(iterator)) != NULL) {
+        if (cl == (rfbClientPtr) client) {
+            port = cl->destPort;
+            break;
+        }
+    }
+    rfbReleaseClientIterator(iterator);
+    return port;
+}
+
+JNIEXPORT jstring JNICALL
+Java_net_christianbeier_droidvnc_1ng_MainService_vncGetRepeaterId(JNIEnv *env,
+                                                                  __unused jobject thiz,
+                                                                  jlong client) {
+    return (*env)->NewStringUTF(env, ((rfbClientPtr)client)->repeaterId);
 }

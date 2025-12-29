@@ -1,0 +1,20 @@
+<resources>
+    <!-- Base application theme. -->
+    <style name="AppTheme" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Customize your theme here. -->
+        <item name="colorPrimary">@color/colorPrimary</item>
+        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+        <item name="colorAccent">@color/colorAccent</item>
+        <!-- focus highlight for DPAD navigation on television -->
+        <item name="android:foreground">@drawable/focus_highlight</item>
+    </style>
+
+    <style name="MainButtonStyle" parent="@style/Widget.Material3.Button.TextButton">
+        <!-- Make this square to look nicer with the focus highlight -->
+        <item name="cornerRadius">0dp</item>
+        <!-- Remove Material3 default insets -->
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+    </style>
+
+</resources>
