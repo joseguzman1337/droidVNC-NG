@@ -12,3 +12,6 @@
 /captures
 .externalNativeBuild
 .cxx
+
+# macOS system files
+._*
